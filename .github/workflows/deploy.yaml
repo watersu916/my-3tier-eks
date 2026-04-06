@@ -1,0 +1,76 @@
+name: CI/CD - Build & Deploy WordPress to EKS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-northeast-2
+  EKS_CLUSTER_NAME: my-3tier-cluster
+  ECR_REPOSITORY: my-wordpress
+
+jobs:
+  build-and-deploy:
+    name: Build → Push ECR → Deploy EKS
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 소스코드 체크아웃
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # 2. AWS 자격증명 설정
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3. ECR 로그인
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 4. Docker 이미지 빌드 & ECR Push
+      # GitHub Actions Runner가 Docker 빌드를 대신 수행
+      - name: Build and push WordPress image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "Building image: $IMAGE_URI"
+          docker build -t $IMAGE_URI ./web
+
+          echo "Pushing image to ECR..."
+          docker push $IMAGE_URI
+
+          # latest 태그도 함께 push
+          docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      # 5. kubeconfig 업데이트
+      # GitHub Actions Runner가 EKS 클러스터에 접근할 수 있도록 설정
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region $AWS_REGION \
+            --name $EKS_CLUSTER_NAME
+
+      # 6. EKS에 새 이미지로 배포
+      - name: Deploy to EKS
+        run: |
+          kubectl set image deployment/wordpress \
+            wordpress=$IMAGE_URI
+
+      # 7. 배포 완료 확인
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/wordpress --timeout=120s
+          echo "✅ 배포 완료!"
+          kubectl get pods -l app=wordpress
